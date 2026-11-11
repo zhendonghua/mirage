@@ -20,6 +20,9 @@
 #endif
 #include "mpk_atoms.cuh"
 #include "runtime_header.h"
+#if defined(MODE_ONLINE_PINNED)
+#include "gpu_prefix_cache.cuh"
+#endif
 #ifdef USE_NVSHMEM
 #include <mpi.h>
 #if defined(MIRAGE_GRACE_BLACKWELL)
@@ -188,10 +191,28 @@ __global__ void init_kernel(RuntimeConfig config) {
     *config.avail_uncommitted = MPK_MAX_NUM_PAGES;
     for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
       config.reserved_remaining[i] = 0;
+      config.gpu_row_num_prefix_pages[i] = 0;
+    }
+    // Counters restart with the kernel; the parameters below PC_CTL_STATS
+    // are Python's and survive a relaunch.
+    for (int i = PC_CTL_TICK; i < PC_CTL_SIZE; i++) {
+      config.gpu_prefix_ctl[i] = 0;
     }
 #endif
 #endif
   }
+#if defined(MODE_ONLINE_PINNED)
+  // The prefix index is large enough to be worth every thread of the block.
+  {
+    PrefixEntry *table = static_cast<PrefixEntry *>(config.gpu_prefix_table);
+    for (int i = threadIdx.x; i < PC_TABLE_SIZE; i += blockDim.x) {
+      table[i].page_id = PC_EMPTY;
+    }
+    for (int i = threadIdx.x; i < MPK_MAX_NUM_PAGES; i += blockDim.x) {
+      config.gpu_prefix_page_slot[i] = -1;
+    }
+  }
+#endif
 }
 
 __global__ void prepare_kernel(RuntimeConfig config,
@@ -482,6 +503,140 @@ __device__ __forceinline__ bool
 // (avail_uncommitted / reserved_remaining) makes the extra round trip safe: a
 // request is admitted only once its worst-case page budget is already free.
 
+// ── GPU prefix cache: helper lanes ─────────────────────────────────────────
+// prepare_next_batch runs on lane 0 of a scheduler warp; lanes 1..31 of that
+// warp otherwise do nothing for the life of the kernel. When the prefix cache
+// is on they wait on a per-warp shared-memory mailbox instead, and lane 0
+// hands them the match, the completion insert and the eviction sweep, which
+// they run 31-wide (pc_w_*). Lane 0's own code path is untouched: it posts a
+// request, spins on the reply, and reads the result. Independent thread
+// scheduling (sm_70+) keeps both sides of the warp making progress, and the
+// helpers synchronise only among themselves (mask 0xFFFFFFFE).
+struct PcMailbox {
+  int seq;   // lane 0 bumps it to post; helpers act on a change
+  int done;  // helpers write the seq they finished
+  int op;
+  int a0, a1, a2, a3;
+  unsigned tick;
+  int r0, r1, r2, r3;
+  int pages[MPK_MAX_PAGES_PER_REQ];
+  int slots[MPK_MAX_PAGES_PER_REQ];
+};
+constexpr int PC_OP_NONE = 0;
+constexpr int PC_OP_MATCH = 1;
+constexpr int PC_OP_INSERT = 2;
+constexpr int PC_OP_EVICT = 3;
+constexpr int PC_OP_EXIT = 4;
+constexpr unsigned PC_HELPER_MASK = 0xFFFFFFFEu;
+__shared__ PcMailbox pc_mailbox[4]; // one per scheduler warp of the block
+
+__device__ __forceinline__ void pc_helper_loop(RuntimeConfig const &config,
+                                               int lane,
+                                               PcMailbox volatile *mb) {
+  PcLanes w;
+  w.mask = PC_HELPER_MASK;
+  w.l = lane - 1;
+  w.width = 31;
+  PrefixEntry *table = static_cast<PrefixEntry *>(config.gpu_prefix_table);
+  int last = 0;
+  while (true) {
+    int seq;
+    while ((seq = mb->seq) == last) {
+      __nanosleep(64);
+    }
+    __threadfence_block();
+    last = seq;
+    int op = mb->op;
+    __syncwarp(PC_HELPER_MASK);
+    if (op == PC_OP_EXIT) {
+      break;
+    }
+    if (op == PC_OP_MATCH) {
+      int row = mb->a0;
+      int n = pc_w_match(w, table,
+                         &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                         mb->a1, mb->a2,
+                         const_cast<int *>(mb->pages),
+                         const_cast<int *>(mb->slots));
+      if (w.l == 0) {
+        mb->r0 = n;
+      }
+    } else if (op == PC_OP_INSERT) {
+      int row = mb->a0;
+      PcInsertResult r = pc_w_insert_sequence(
+          w, table, &config.tokens[row * MPK_MAX_SEQ_LENGTH], mb->a1,
+          &config.paged_kv_indices_buffer[mb->a2], mb->a3, mb->tick,
+          config.gpu_prefix_page_slot);
+      if (w.l == 0) {
+        mb->r0 = r.inserted;
+        mb->r1 = r.deduped;
+        mb->r2 = r.chain_dropped;
+        mb->r3 = r.full;
+      }
+    } else if (op == PC_OP_EVICT) {
+      int page = pc_w_evict_one(w, table, config.gpu_prefix_page_slot,
+                                config.gpu_prefix_ctl);
+      if (w.l == 0) {
+        mb->r0 = page;
+      }
+    }
+    __threadfence_block();
+    __syncwarp(PC_HELPER_MASK);
+    if (w.l == 0) {
+      mb->done = seq;
+    }
+  }
+}
+
+// Lane 0 side: post and wait. The mailbox pointer is null when the helpers
+// are not armed (cache off, or PC_CTL_WARP == 0), and the callers fall back
+// to the serial functions.
+__device__ __forceinline__ void pc_mb_post(PcMailbox volatile *mb, int op) {
+  mb->op = op;
+  __threadfence_block();
+  int seq = mb->seq + 1;
+  mb->seq = seq;
+  while (mb->done != seq) {
+    __nanosleep(32);
+  }
+  __threadfence_block();
+}
+
+__device__ __forceinline__ int pc_mb_match(PcMailbox volatile *mb, int row,
+                                           int prompt_len, int max_pages,
+                                           int *out_pages, int *out_slots) {
+  mb->a0 = row;
+  mb->a1 = prompt_len;
+  mb->a2 = max_pages;
+  pc_mb_post(mb, PC_OP_MATCH);
+  int n = mb->r0;
+  for (int j = 0; j < n; j++) {
+    out_pages[j] = mb->pages[j];
+    out_slots[j] = mb->slots[j];
+  }
+  return n;
+}
+
+__device__ __forceinline__ PcInsertResult pc_mb_insert(PcMailbox volatile *mb,
+                                                       int row, int seq_len,
+                                                       int kv_indptr,
+                                                       int num_prefix,
+                                                       unsigned tick) {
+  mb->a0 = row;
+  mb->a1 = seq_len;
+  mb->a2 = kv_indptr;
+  mb->a3 = num_prefix;
+  mb->tick = tick;
+  pc_mb_post(mb, PC_OP_INSERT);
+  PcInsertResult r = {mb->r0, mb->r1, mb->r2, mb->r3};
+  return r;
+}
+
+__device__ __forceinline__ int pc_mb_evict(PcMailbox volatile *mb) {
+  pc_mb_post(mb, PC_OP_EVICT);
+  return mb->r0;
+}
+
 // Per-iteration budget for the Step 0 drain. The scheduler lane is a single
 // thread reading pinned host memory across PCIe, so an unbounded drain would
 // put an arbitrarily long serial stall on the barrier point; the remainder is
@@ -490,7 +645,20 @@ constexpr int MPK_PAGE_RETURN_DRAIN_LIMIT = 32;
 
 __device__ __forceinline__ bool
     prepare_next_batch(RuntimeConfig const &config) {
-  __shared__ int smem_kv_indices[MPK_MAX_NUM_PAGES];
+  // Step 2 snapshots the page table of the *current batch*, never the pool, so
+  // this is bounded by what the batch can hold: the admission gate reserves
+  // MPK_MAX_PAGES_PER_REQ per request (Step 4) and there are at most
+  // MPK_MAX_NUM_BATCHED_REQUESTS of them.
+  //
+  // Sizing it by MPK_MAX_NUM_PAGES instead made the pool a static-shared-memory
+  // cost paid by *every* block in the grid, workers included, even though only
+  // the one scheduler thread that runs this ever touches it. At PAGE_SIZE=64 a
+  // pool big enough to be worth caching into (8192 pages = 32 KB) pushed the
+  // worker launch past the 228 KB SM limit -- and the split worker/scheduler
+  // path does not check the launch, so it surfaced as the scheduler spinning
+  // forever against workers that never started, not as an error.
+  __shared__ int
+      smem_kv_indices[MPK_MAX_NUM_BATCHED_REQUESTS * MPK_MAX_PAGES_PER_REQ];
   int page_queue_head = *config.page_queue_head;
   int page_queue_tail = *config.page_queue_tail;
   int gpu_req_head = *config.gpu_req_head;
@@ -500,6 +668,20 @@ __device__ __forceinline__ bool
   int gpu_return_head = *config.gpu_return_head;
   int const ring_mask = MPK_PINNED_RING_CAPACITY - 1;
   int const return_mask = MPK_PAGE_RETURN_RING_CAPACITY - 1;
+  // GPU prefix index (shadow of the CPU cache while it is being brought up).
+  // Everything below is a plain store from the one scheduler lane; nothing
+  // else reads the table during an iteration.
+  PrefixEntry *pc_table = static_cast<PrefixEntry *>(config.gpu_prefix_table);
+  int32_t *pc_ctl = config.gpu_prefix_ctl;
+  int const pc_mode = pc_ctl[PC_CTL_ENABLED];
+  bool const pc_enabled = pc_mode != 0;
+  bool const pc_owner = pc_mode == PC_MODE_OWNER;
+  unsigned const pc_tick = static_cast<unsigned>(++pc_ctl[PC_CTL_TICK]);
+  // Helper lanes of this warp, if armed (see pc_helper_loop).
+  PcMailbox volatile *pc_mb =
+      (pc_enabled && pc_ctl[PC_CTL_WARP] != 0)
+          ? &pc_mailbox[(threadIdx.x / 32) & 3]
+          : nullptr;
 
   // Reclaim rows only after the CPU has copied their completed output and
   // release-stored -1 to pinned_step. The owner mapping stays stable for the
@@ -522,8 +704,19 @@ __device__ __forceinline__ bool
     int drained = 0;
     while (gpu_return_head != (int)return_tail &&
            drained < MPK_PAGE_RETURN_DRAIN_LIMIT) {
-      config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] =
+      int page =
           (int)config.pinned_page_return_ring[gpu_return_head & return_mask];
+      if (pc_enabled) {
+        // A returned page is one the CPU cache no longer holds (evicted, or
+        // never cached); the index drops the block it owned, if any.
+        if (pc_erase(pc_table, config.gpu_prefix_page_slot, page)) {
+          pc_ctl[PC_STAT_ERASED]++;
+          pc_ctl[PC_STAT_RESIDENT]--;
+        } else {
+          pc_ctl[PC_STAT_ERASE_MISS]++;
+        }
+      }
+      config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] = page;
       page_queue_tail++;
       avail_uncommitted++;
       gpu_return_head++;
@@ -595,6 +788,58 @@ __device__ __forceinline__ bool
       st_release_sys_i32(&config.pinned_comp_ready[comp_slot], 1);
       gpu_comp_tail++;
 
+      if (pc_enabled) {
+        // Mirror PrefixCache.insert: index the full pages of the cacheable
+        // prompt range, min(prompt_len, final_kv_len) - gen_tail, continuing
+        // the chain from the pages this row imported. Same inputs as the
+        // CPU's, read from the row instead of a pinned readback.
+        int final_kv_len = step + num_tokens;
+        int cacheable = prompt_len < final_kv_len ? prompt_len : final_kv_len;
+        cacheable -= pc_ctl[PC_CTL_GEN_TAIL];
+        unsigned long long t0 = pc_now_ns();
+        PcInsertResult r =
+            pc_mb ? pc_mb_insert(pc_mb, row, cacheable, kv_indptr,
+                                 config.gpu_row_num_prefix_pages[row], pc_tick)
+                  : pc_insert_sequence(
+                        pc_table,
+                        &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                        cacheable,
+                        &config.paged_kv_indices_buffer[kv_indptr],
+                        config.gpu_row_num_prefix_pages[row],
+                        pc_tick,
+                        config.gpu_prefix_page_slot);
+        pc_add_ns(pc_ctl, PC_STAT_INSERT_NS, pc_now_ns() - t0);
+        pc_ctl[PC_STAT_COMPLETIONS]++;
+        pc_ctl[PC_STAT_INSERTED] += r.inserted;
+        pc_ctl[PC_STAT_RESIDENT] += r.inserted;
+        pc_ctl[PC_STAT_DEDUPED] += r.deduped;
+        pc_ctl[PC_STAT_CHAIN_DROPPED] += r.chain_dropped;
+        pc_ctl[PC_STAT_FULL] += r.full;
+
+        if (pc_owner) {
+          // The kernel owns the pages: the imported blocks lose this row's
+          // pin, and every page of the table that owns no block -- deduped,
+          // partial, generated -- goes straight back to the free queue. The
+          // CPU only reads the export; it returns nothing in this mode.
+          int npp = config.gpu_row_num_prefix_pages[row];
+          for (int j = 0; j < num_pages; j++) {
+            int page = config.paged_kv_indices_buffer[kv_indptr + j];
+            int s = config.gpu_prefix_page_slot[page];
+            if (j < npp && s >= 0) {
+              pc_table[s].refcount--;
+            }
+            if (s < 0) {
+              config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] = page;
+              page_queue_tail++;
+              avail_uncommitted++;
+              pc_ctl[PC_STAT_FREED]++;
+            }
+          }
+          // Pins dropped and blocks added: a sweep may find something again.
+          pc_ctl[PC_CTL_EVICT_STALL] = 0;
+        }
+      }
+
       // Retain the row and owner until the CPU acknowledges its completed
       // read through pinned_step[row] = -1.
       // Mark batch slot as empty.
@@ -613,6 +858,9 @@ __device__ __forceinline__ bool
   // ── Step 2: snapshot current kv_indices to shared memory ───────────────────
   int num_pages_total =
       config.paged_kv_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+  // Guards the batch-sized snapshot above. Compiled out under NDEBUG.
+  assert(num_pages_total <=
+         MPK_MAX_NUM_BATCHED_REQUESTS * MPK_MAX_PAGES_PER_REQ);
   for (int i = 0; i < num_pages_total; i++) {
     smem_kv_indices[i] = config.paged_kv_indices_buffer[i];
   }
@@ -699,21 +947,115 @@ __device__ __forceinline__ bool
     // the reservation, so an admitted request can never be outbid mid-flight
     // and the page queue can never underflow.
     int worst_need = MPK_MAX_PAGES_PER_REQ - num_prefix_pages;
-    if (avail_uncommitted < worst_need) {
-      break;
+    int row;
+    int inbox_base = req_slot * MPK_MAX_SEQ_LENGTH;
+    // Owner mode: the match needs the prompt in device memory, so the row is
+    // popped and filled before the gate; a refused admission hands it back.
+    int gpu_pages[MPK_MAX_PAGES_PER_REQ];
+    int gpu_slots[MPK_MAX_PAGES_PER_REQ];
+    int gpu_n = 0;
+    // A caller-chosen start (initial_step != 0) disables matching, as on
+    // the CPU: the two cannot both set it.
+    bool const owner_match = pc_owner && initial_step == 0;
+    if (owner_match) {
+      row = config.free_rows[--free_row_top];
+      for (int j = 0; j < prompt_len; j++) {
+        config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
+            config.pinned_inbox_tokens[inbox_base + j];
+      }
+      unsigned long long t0 = pc_now_ns();
+      gpu_n = pc_mb ? pc_mb_match(pc_mb, row, prompt_len,
+                                  MPK_MAX_PAGES_PER_REQ, gpu_pages, gpu_slots)
+                    : pc_match(pc_table,
+                               &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                               prompt_len,
+                               MPK_MAX_PAGES_PER_REQ,
+                               gpu_pages,
+                               gpu_slots);
+      pc_add_ns(pc_ctl, PC_STAT_MATCH_NS, pc_now_ns() - t0);
+      pc_ctl[PC_STAT_MATCH_CALLS]++;
+      pc_ctl[PC_STAT_MATCH_PAGES] += gpu_n;
+      // Pin before evicting so the sweep cannot take what was just matched.
+      pc_pin_slots(pc_table, gpu_slots, gpu_n, pc_tick);
+      num_prefix_pages = gpu_n;
+      initial_step = gpu_n * MPK_PAGE_SIZE;
+      worst_need = MPK_MAX_PAGES_PER_REQ - gpu_n;
+      // Evict on demand: cached pages are the pool's slack. A page freed
+      // here is uncommitted again; the ledger identity holds.
+      if (avail_uncommitted < worst_need) {
+        unsigned long long e0 = pc_now_ns();
+        while (avail_uncommitted < worst_need) {
+          int page = pc_mb ? pc_mb_evict(pc_mb)
+                           : pc_evict_one(pc_table,
+                                          config.gpu_prefix_page_slot, pc_ctl);
+          if (page < 0) {
+            break;
+          }
+          config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] = page;
+          page_queue_tail++;
+          avail_uncommitted++;
+          pc_ctl[PC_STAT_EVICTED]++;
+          pc_ctl[PC_STAT_RESIDENT]--;
+        }
+        pc_add_ns(pc_ctl, PC_STAT_EVICT_NS, pc_now_ns() - e0);
+      }
+      if (avail_uncommitted < worst_need) {
+        // Every leaf is pinned: the pool is committed to running requests.
+        // Undo and retry next iteration, like the plain gate below.
+        pc_unpin_slots(pc_table, gpu_slots, gpu_n);
+        config.free_rows[free_row_top++] = row;
+        pc_ctl[PC_STAT_ADMIT_HOLD]++;
+        break;
+      }
+    } else {
+      if (avail_uncommitted < worst_need) {
+        break;
+      }
+      // Pop a free buffer row and copy inbox tokens from this ring slot.
+      row = config.free_rows[--free_row_top];
+      for (int j = 0; j < prompt_len; j++) {
+        config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
+            config.pinned_inbox_tokens[inbox_base + j];
+      }
     }
     avail_uncommitted -= worst_need;
-
-    // Pop a free buffer row and copy inbox tokens from this ring slot.
-    int row = config.free_rows[--free_row_top];
     config.reserved_remaining[row] = worst_need;
-    int inbox_base = req_slot * MPK_MAX_SEQ_LENGTH;
-    for (int j = 0; j < prompt_len; j++) {
-      config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
-          config.pinned_inbox_tokens[inbox_base + j];
-    }
+    config.gpu_row_num_prefix_pages[row] = num_prefix_pages;
     config.prompt_length[row] = prompt_len;
     config.step[row] = initial_step;
+
+    if (pc_enabled && !pc_owner) {
+      // Shadow match against the row's own copy of the prompt (device memory;
+      // the inbox is pinned host memory and would be hashed across PCIe).
+      // Same inputs as PrefixCache.match: the whole prompt, capped so at
+      // least one token is left to prefill. Nothing here changes what is
+      // admitted; the result is only compared with the CPU's import.
+      unsigned long long t0 = pc_now_ns();
+      int n = pc_mb ? pc_mb_match(pc_mb, row, prompt_len,
+                                  MPK_MAX_PAGES_PER_REQ, gpu_pages, gpu_slots)
+                    : pc_match(pc_table,
+                               &config.tokens[row * MPK_MAX_SEQ_LENGTH],
+                               prompt_len,
+                               MPK_MAX_PAGES_PER_REQ,
+                               gpu_pages,
+                               gpu_slots);
+      pc_add_ns(pc_ctl, PC_STAT_MATCH_NS, pc_now_ns() - t0);
+      pc_ctl[PC_STAT_MATCH_CALLS]++;
+      pc_ctl[PC_STAT_MATCH_PAGES] += n;
+      pc_ctl[PC_STAT_MATCH_CPU_PAGES] += num_prefix_pages;
+      if (n < num_prefix_pages) {
+        pc_ctl[PC_STAT_MATCH_SHORTER]++;
+      } else if (n > num_prefix_pages) {
+        pc_ctl[PC_STAT_MATCH_LONGER]++;
+      }
+      int common = n < num_prefix_pages ? n : num_prefix_pages;
+      for (int j = 0; j < common; j++) {
+        if (gpu_pages[j] != config.pinned_req_prefix_pages[prefix_page_base + j]) {
+          pc_ctl[PC_STAT_MATCH_PAGE_DIFF]++;
+          break;
+        }
+      }
+    }
     // Reset progress before release-publishing the owner. An observer that
     // finds new_rid must not see progress or tokens from the prior lease.
     st_release_sys_i32(&config.pinned_step[row], initial_step);
@@ -740,11 +1082,13 @@ __device__ __forceinline__ bool
         paged_kv_last_page_len(initial_step + num_new_tokens);
 
     // Two-phase page-table fill: slots below num_prefix_pages are imported
-    // from the CPU's prefix array, the rest are fresh pages off the queue.
+    // from the CPU's prefix array (or the kernel's own match in owner mode),
+    // the rest are fresh pages off the queue.
     for (int j = 0; j < num_new_pages; j++) {
       if (j < num_prefix_pages) {
         config.paged_kv_indices_buffer[num_pages + j] =
-            config.pinned_req_prefix_pages[prefix_page_base + j];
+            owner_match ? gpu_pages[j]
+                        : config.pinned_req_prefix_pages[prefix_page_base + j];
       } else {
         config.paged_kv_indices_buffer[num_pages + j] =
             config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
@@ -1219,8 +1563,46 @@ __device__ __forceinline__ void execute_worker(RuntimeConfig config) {
 }
 
 // need to alter as there is only one warp per block
+__device__ __forceinline__ void execute_scheduler_lane0(RuntimeConfig config,
+                                                        int offset);
+
 __device__ __forceinline__ void execute_scheduler(RuntimeConfig config,
                                                   int offset) {
+#if defined(MODE_ONLINE_PINNED)
+  int const lane = threadIdx.x % 32;
+  int const warp_id = threadIdx.x / 32;
+  bool const sched_warp = warp_id < std::min((int)blockDim.x / 32, 4);
+  bool const helpers_armed =
+      sched_warp && config.gpu_prefix_ctl[PC_CTL_ENABLED] != 0 &&
+      config.gpu_prefix_ctl[PC_CTL_WARP] != 0;
+  if (helpers_armed) {
+    // The warp is still converged here: lane 0 initialises the mailbox and
+    // every lane sees it before anyone reads it.
+    PcMailbox volatile *mb = &pc_mailbox[warp_id & 3];
+    if (lane == 0) {
+      mb->seq = 0;
+      mb->done = 0;
+      mb->op = PC_OP_NONE;
+    }
+    __syncwarp();
+    if (lane != 0) {
+      pc_helper_loop(config, lane, mb);
+      return;
+    }
+    execute_scheduler_lane0(config, offset);
+    // The scheduler is done (termination event): release the helpers or the
+    // block never exits.
+    mb->op = PC_OP_EXIT;
+    __threadfence_block();
+    mb->seq = mb->seq + 1;
+    return;
+  }
+#endif
+  execute_scheduler_lane0(config, offset);
+}
+
+__device__ __forceinline__ void execute_scheduler_lane0(RuntimeConfig config,
+                                                        int offset) {
   int const num_schedulers =
       config.num_local_schedulers + config.num_remote_schedulers;
   // if we have more than 4 warps per thread block
@@ -1577,6 +1959,8 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[28]: pinned_page_return_tail
 // meta_tensors[29]: pinned_page_return_head_mirror
 // meta_tensors[30]: pinned_page_free_count_mirror
+// meta_tensors[31]: gpu_prefix_table (device)
+// meta_tensors[32]: gpu_prefix_ctl (device)
 
 extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
@@ -1606,8 +1990,9 @@ extern "C" void
   // meta_tensors[0..10] are always required.
   // meta_tensors[11..30]: pinned ring pointers (MODE_ONLINE_PINNED only,
   //   passed as CPU-side void* from Python's pinned tensors)
+  // meta_tensors[31..32]: GPU prefix index table and control block (device)
 #if defined(MODE_ONLINE_PINNED)
-  assert(meta_tensors.size() == 31);
+  assert(meta_tensors.size() == 33);
 #else
   assert(meta_tensors.size() == 11);
 #endif
@@ -1669,6 +2054,8 @@ extern "C" void
       static_cast<int32_t volatile *>(meta_tensors[29]);
   global_runtime_config.pinned_page_free_count_mirror =
       static_cast<int32_t volatile *>(meta_tensors[30]);
+  global_runtime_config.gpu_prefix_table = meta_tensors[31];
+  global_runtime_config.gpu_prefix_ctl = static_cast<int32_t *>(meta_tensors[32]);
 #endif
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
@@ -1749,6 +2136,10 @@ extern "C" void
   global_runtime_config.gpu_return_head = gpu_malloc<int>(sizeof(int));
   global_runtime_config.avail_uncommitted = gpu_malloc<int>(sizeof(int));
   global_runtime_config.reserved_remaining =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS);
+  global_runtime_config.gpu_prefix_page_slot =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_PAGES);
+  global_runtime_config.gpu_row_num_prefix_pages =
       gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS);
 #endif
 #endif
@@ -2044,7 +2435,9 @@ extern "C" void finalize_persistent_kernel() {
   gpu_free(global_runtime_config.gpu_return_head);
   gpu_free(global_runtime_config.avail_uncommitted);
   gpu_free(global_runtime_config.reserved_remaining);
-  // pinned ring arrays (meta_tensors[11..30]) are Python-owned; do not free.
+  gpu_free(global_runtime_config.gpu_prefix_page_slot);
+  gpu_free(global_runtime_config.gpu_row_num_prefix_pages);
+  // pinned ring arrays (meta_tensors[11..32]) are Python-owned; do not free.
 #endif
 #endif
   int num_workers = global_runtime_config.num_workers;

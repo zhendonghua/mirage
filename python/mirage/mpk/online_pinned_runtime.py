@@ -47,6 +47,7 @@ drives the ticks itself, so the snippet above works single-threaded too.
 
 import collections
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -56,6 +57,11 @@ import torch
 
 from .persistent_kernel import max_pages_per_request
 from .prefix_cache import EMPTY_MATCH, Block, PrefixCache, PrefixMatch
+from .gpu_prefix_cache import (
+    PC_CTL_ENABLED, PC_CTL_GEN_TAIL, PC_CTL_WARP, PC_MODE_OFF, PC_MODE_OWNER,
+    PC_MODE_SHADOW, check_structure, compare_with_cpu, decode_stats,
+    decode_table,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +93,7 @@ class OnlinePinnedRuntime:
         enable_prefix_cache: bool = False,
         prefix_cache_pages: int = 0,
         gen_tail_len: int = 0,
+        gpu_prefix_cache: bool = False,
     ):
         assert mpk.metadata.mode == "online_pinned", (
             f"OnlinePinnedRuntime requires mode='online_pinned', got {mpk.metadata.mode}"
@@ -96,11 +103,22 @@ class OnlinePinnedRuntime:
         self._mask = self._cap - 1
         self._total_inflight = mpk.total_num_requests
 
-        # Pinned CPU↔GPU ring arrays (allocated in mpk.py, shape=[cap])
+        # Pinned CPU↔GPU ring arrays (allocated in mpk.py, shape=[cap]).
+        #
+        # A buffer the owner tick *writes* is held as a numpy view instead of
+        # a tensor.  The view aliases the same page-locked memory --
+        # the GPU cannot tell the difference -- but `tensor[i] = v` costs a full
+        # ATen dispatch (~4 us measured), and the owner tick writes a prefix
+        # array per publish plus up to MAX_EVICTIONS_PER_TICK page ids per
+        # return, on the thread that also drives admission.  The read side
+        # already batches through a tensor slice + tolist(); this gives the
+        # write side the same treatment.  Only the view is kept, so there is no
+        # second, slower way to write the same buffer -- and the view owns the
+        # storage, so the tensor needs no separate reference.
         self._req_ready         = mpk.pinned_req_ready        # int32, pinned
-        self._req_request_id    = mpk.pinned_req_request_id   # int32, pinned
-        self._req_prompt_len    = mpk.pinned_req_prompt_len   # int32, pinned
-        self._req_initial_step  = mpk.pinned_req_initial_step # int32, pinned
+        self._req_request_id    = mpk.pinned_req_request_id.numpy()
+        self._req_prompt_len    = mpk.pinned_req_prompt_len.numpy()
+        self._req_initial_step  = mpk.pinned_req_initial_step.numpy()
         self._comp_ready        = mpk.pinned_comp_ready       # int32, pinned
         self._comp_request_id   = mpk.pinned_comp_request_id  # int32, pinned
         self._comp_buffer_row   = mpk.pinned_comp_buffer_row  # int32, pinned
@@ -117,9 +135,9 @@ class OnlinePinnedRuntime:
         # import channel stays inert -- num_prefix_pages is always 0.
         self._comp_num_pages       = mpk.pinned_comp_num_pages
         self._comp_pages           = mpk.pinned_comp_pages
-        self._req_num_prefix_pages = mpk.pinned_req_num_prefix_pages
-        self._req_prefix_pages     = mpk.pinned_req_prefix_pages
-        self._page_return_ring     = mpk.pinned_page_return_ring
+        self._req_num_prefix_pages = mpk.pinned_req_num_prefix_pages.numpy()
+        self._req_prefix_pages     = mpk.pinned_req_prefix_pages.numpy()
+        self._page_return_ring     = mpk.pinned_page_return_ring.numpy()
         self._page_return_tail     = mpk.pinned_page_return_tail
         self._page_return_head_mirror = mpk.pinned_page_return_head_mirror
         self._page_free_count_mirror  = mpk.pinned_page_free_count_mirror
@@ -165,6 +183,30 @@ class OnlinePinnedRuntime:
         self._gen_tail_len = gen_tail_len
         self._published: Dict[int, _Published] = {}
         self._unadmitted: Deque[_Published] = collections.deque()
+
+        # GPU-resident prefix index (experimental).  With the CPU cache on as
+        # well it runs in shadow mode: the kernel maintains it from the same
+        # completions and page returns the CPU cache sees, and the CPU can
+        # diff the two.  With the CPU cache off it is the owner: the kernel
+        # matches, pins, indexes, frees and evicts by itself, and this side
+        # neither matches nor returns pages.  The readback buffers are pinned
+        # and allocated here, up front: a host allocation under a running
+        # persistent kernel is not something to do on a debug path.
+        self._gpu_prefix_mode = PC_MODE_OFF
+        if gpu_prefix_cache:
+            self._gpu_prefix_mode = (
+                PC_MODE_SHADOW if enable_prefix_cache else PC_MODE_OWNER)
+        self._gpu_prefix_enabled = self._gpu_prefix_mode != PC_MODE_OFF
+        self._pc_table = mpk.gpu_prefix_table
+        self._pc_ctl = mpk.gpu_prefix_ctl
+        self._pc_table_host: Optional[torch.Tensor] = None
+        self._pc_ctl_host: Optional[torch.Tensor] = None
+        if self._gpu_prefix_enabled:
+            self._pc_table_host = torch.empty_like(
+                self._pc_table, device="cpu").pin_memory()
+            self._pc_ctl_host = torch.empty_like(
+                self._pc_ctl, device="cpu").pin_memory()
+        self._write_gpu_prefix_params()
 
         # Dedicated stream for HtoD / DtoH copies.
         self._write_stream = torch.cuda.Stream(device=mpk.tokens.device)
@@ -352,10 +394,10 @@ class OnlinePinnedRuntime:
         self._req_request_id[slot] = rid
         self._req_prompt_len[slot] = prompt_len
         self._req_initial_step[slot] = initial_step
+        npp = len(prefix_pages)
         base = slot * self._pages_per_req
-        for offset, page in enumerate(prefix_pages):
-            self._req_prefix_pages[base + offset] = page
-        self._req_num_prefix_pages[slot] = len(prefix_pages)
+        self._req_prefix_pages[base:base + npp] = prefix_pages
+        self._req_num_prefix_pages[slot] = npp
         self._store_i32_release(self._req_ready, slot, 1)
 
     def drain_completions(self) -> List[Tuple[int, int, int]]:
@@ -477,6 +519,10 @@ class OnlinePinnedRuntime:
         the chain.  The rest go to the return ring, as they always did.
         """
         info = self._published.pop(rid, None)
+        if self._gpu_prefix_mode == PC_MODE_OWNER:
+            # The kernel cached or freed every page of this table itself
+            # before exporting it; the export is read-only for us.
+            return
         if self._cache is None or info is None or info.prompt_ids is None:
             self._return_pages_locked(pages)
             return
@@ -552,10 +598,19 @@ class OnlinePinnedRuntime:
         """
         if not pages:
             return
+        n = len(pages)
+        ring = self._page_return_ring
         tail = self._cpu_return_tail
-        for page in pages:
-            self._page_return_ring[tail & self._return_mask] = page
-            tail += 1
+        start = tail & self._return_mask
+        # The occupancy argument above bounds one write by the ring capacity,
+        # so it wraps at most once and two slices always suffice.  A batch that
+        # broke that bound raises a broadcast error here rather than silently
+        # overwriting entries the GPU has not drained yet.
+        head_len = min(n, ring.shape[0] - start)
+        ring[start:start + head_len] = pages[:head_len]
+        if head_len < n:
+            ring[:n - head_len] = pages[head_len:]
+        tail += n
         self._cpu_return_tail = tail
         self._store_i32_release(self._page_return_tail, 0, tail)
         self._page_stats["returned_pages"] += len(pages)
@@ -586,6 +641,91 @@ class OnlinePinnedRuntime:
             stats.update(("cache_" + key, value)
                          for key, value in cache_stats.items())
         return stats
+
+    # ── GPU prefix index (shadow mode) ───────────────────────────────────
+
+    def _write_gpu_prefix_params(self) -> None:
+        """Publish the enable flag and gen-tail length to the control block.
+
+        Called only while the kernel is not running (construction, reset), so
+        the small device writes cannot interleave with the scheduler lane.
+        """
+        if self._pc_ctl is None:
+            return
+        self._pc_ctl[PC_CTL_ENABLED] = self._gpu_prefix_mode
+        self._pc_ctl[PC_CTL_GEN_TAIL] = self._gen_tail_len
+        # The helper lanes are the default; MPK_GPU_PREFIX_SERIAL=1 keeps the
+        # serial path for an A/B on the same build.
+        self._pc_ctl[PC_CTL_WARP] = (
+            0 if os.environ.get("MPK_GPU_PREFIX_SERIAL") == "1" else 1)
+
+    @property
+    def gpu_prefix_enabled(self) -> bool:
+        return self._gpu_prefix_enabled
+
+    @property
+    def max_num_pages(self) -> int:
+        return self._max_num_pages
+
+    @property
+    def gpu_prefix_mode(self) -> str:
+        return {PC_MODE_OFF: "off", PC_MODE_SHADOW: "shadow",
+                PC_MODE_OWNER: "owner"}[self._gpu_prefix_mode]
+
+    def _gpu_prefix_readback(self, with_table: bool):
+        """Copy the control block (and optionally the table) to pinned host."""
+        with torch.cuda.stream(self._write_stream):
+            self._pc_ctl_host.copy_(self._pc_ctl, non_blocking=True)
+            if with_table:
+                self._pc_table_host.copy_(self._pc_table, non_blocking=True)
+        self._write_stream.synchronize()
+
+    def gpu_prefix_stats(self) -> Dict[str, int]:
+        """The kernel's counters for its index, as of its last iteration."""
+        if not self._gpu_prefix_enabled:
+            return {"enabled": 0}
+        self._gpu_prefix_readback(with_table=False)
+        return decode_stats(self._pc_ctl_host.numpy())
+
+    def gpu_prefix_check(self, settle: float = 2.0) -> Dict[str, object]:
+        """Check the GPU index: against the CPU cache in shadow mode, against
+        itself in owner mode.
+
+        In shadow mode the two are maintained at different points of a
+        request's life -- the GPU indexes at completion, the CPU when it reaps
+        that completion; the CPU evicts, the GPU erases when the returned page
+        is drained -- so they only agree once nothing is in flight and the
+        return ring is drained.  Waits up to *settle* seconds for that, then
+        snapshots both under ``_owner_lock`` so the CPU side cannot move
+        during the diff.  In owner mode the snapshot is checked for structural
+        consistency (parent links, children counts, no pins while idle).
+        """
+        if not self._gpu_prefix_enabled:
+            return {"enabled": 0}
+        deadline = time.monotonic() + settle
+        while True:
+            with self._owner_lock:
+                with self._admission_lock:
+                    queued = len(self._admission)
+                quiescent = (queued == 0 and not self._published
+                             and self.pending_page_returns == 0)
+                if quiescent or time.monotonic() > deadline:
+                    self._gpu_prefix_readback(with_table=True)
+                    stats = decode_stats(self._pc_ctl_host.numpy())
+                    gpu = decode_table(self._pc_table_host.numpy(),
+                                       self._page_size)
+                    cpu = ({} if self._cache is None
+                           else dict(self._cache._by_page))
+                    break
+            time.sleep(0.01)
+        if self._gpu_prefix_mode == PC_MODE_OWNER:
+            report = check_structure(gpu, idle=quiescent)
+        else:
+            report = compare_with_cpu(gpu, cpu)
+        report["mode"] = self.gpu_prefix_mode
+        report["quiescent"] = quiescent
+        report["gpu_stats"] = stats
+        return report
 
     @property
     def gpu_free_page_count(self) -> int:
@@ -803,10 +943,13 @@ class OnlinePinnedRuntime:
                 # the resident pages this hands back are already the GPU's; the
                 # index simply stops claiming them.
                 self._cache.reset()
+            # init_kernel clears the GPU index and its counters on relaunch
+            # but leaves the parameters to us.
+            self._write_gpu_prefix_params()
             self._req_ready.zero_()
-            self._req_request_id.zero_()
-            self._req_num_prefix_pages.zero_()
-            self._req_prefix_pages.zero_()
+            self._req_request_id[:] = 0
+            self._req_num_prefix_pages[:] = 0
+            self._req_prefix_pages[:] = 0
 
         with self._lock:
             self._cpu_comp_head = 0
@@ -823,7 +966,7 @@ class OnlinePinnedRuntime:
             # anything left in the ring from the previous session is a page the
             # new page_queue already owns.
             self._cpu_return_tail = 0
-            self._page_return_ring.zero_()
+            self._page_return_ring[:] = 0
             self._page_return_tail.zero_()
             self._page_return_head_mirror.zero_()
             self._page_free_count_mirror.zero_()

@@ -112,6 +112,23 @@ async def _stream_bridge(
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 
+@app.get("/debug/prefix_cache")
+async def debug_prefix_cache(settle: float = 2.0):
+    """CPU cache counters plus, with --gpu-prefix-cache, the GPU index's
+    counters and a diff of the two indexes taken once the engine is idle."""
+    runtime = app.state.engine.runtime
+    report = {"cpu": await asyncio.to_thread(lambda: runtime.page_stats),
+              "gpu_mode": runtime.gpu_prefix_mode,
+              # Page conservation at quiesce: free + cached (+ pending
+              # returns, CPU mode) must equal the pool.
+              "pages": {"total": runtime.max_num_pages,
+                        "gpu_free": runtime.gpu_free_page_count,
+                        "pending_returns": runtime.pending_page_returns}}
+    if runtime.gpu_prefix_enabled:
+        report["gpu"] = await asyncio.to_thread(runtime.gpu_prefix_check, settle)
+    return report
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await _parse_json(request)
@@ -196,6 +213,11 @@ def main():
     parser.add_argument("--prefix-cache-pages", default=0, type=int,
                         help="Resident pages for that cache (0 = auto: "
                              "max_num_pages - ceil(max_seq_length/page_size))")
+    parser.add_argument("--gpu-prefix-cache", action="store_true",
+                        help="Experimental: GPU-resident prefix cache owned by "
+                             "the kernel. With --enable-prefix-cache as well it "
+                             "only shadows the CPU cache; inspect either at "
+                             "GET /debug/prefix_cache")
     parser.add_argument("--output-dir", default=None, help="Output directory for compiled artifacts")
     parser.add_argument("--request-timeout", default=7200.0, type=float,
                         help="Per-request timeout in seconds (default: 7200)")
@@ -211,6 +233,7 @@ def main():
         page_size=args.page_size,
         enable_prefix_cache=args.enable_prefix_cache,
         prefix_cache_pages=args.prefix_cache_pages,
+        gpu_prefix_cache=args.gpu_prefix_cache,
         output_dir=args.output_dir,
     )
     app.state.runner_config = config
